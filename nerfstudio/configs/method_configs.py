@@ -1,4 +1,4 @@
-# Copyright 2022 The Nerfstudio Team. All rights reserved.
+# Copyright 2022 the Regents of the University of California, Nerfstudio Team and contributors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,12 +18,14 @@ Put all the method implementations in one location.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import Dict
 
 import tyro
 
 from nerfstudio.cameras.camera_optimizers import CameraOptimizerConfig
 from nerfstudio.configs.base_config import ViewerConfig
+from nerfstudio.configs.external_methods import get_external_methods
 from nerfstudio.data.datamanagers.base_datamanager import (
     VanillaDataManager,
     VanillaDataManagerConfig,
@@ -54,7 +56,6 @@ from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.field_components.temporal_distortions import TemporalDistortionKind
 from nerfstudio.fields.sdf_field import SDFFieldConfig
 from nerfstudio.models.depth_nerfacto import DepthNerfactoModelConfig
-from nerfstudio.models.dreamfusion import DreamFusionModelConfig
 from nerfstudio.models.instant_ngp import InstantNGPModelConfig
 from nerfstudio.models.mipnerf import MipNerfModel
 from nerfstudio.models.nerfacto import NerfactoModelConfig
@@ -65,6 +66,7 @@ from nerfstudio.models.neus_facto import NeuSFactoModelConfig
 from nerfstudio.models.semantic_nerfw import SemanticNerfWModelConfig
 from nerfstudio.models.tensorf import TensoRFModelConfig
 from nerfstudio.models.vanilla_nerf import NeRFModel, VanillaModelConfig
+from nerfstudio.models.dreamfusion import DreamFusionModelConfig
 from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
 from nerfstudio.pipelines.dynamic_batch import DynamicBatchPipelineConfig
 from nerfstudio.plugins.registry import discover_methods
@@ -82,16 +84,16 @@ descriptions = {
     "tensorf": "tensorf",
     "dnerf": "Dynamic-NeRF model. (slow)",
     "phototourism": "Uses the Phototourism data.",
-    "dreamfusion": "Generative Text to NeRF model",
     "nerfplayer-nerfacto": "NeRFPlayer with nerfacto backbone.",
     "nerfplayer-ngp": "NeRFPlayer with InstantNGP backbone.",
     "neus": "Implementation of NeuS. (slow)",
     "neus-facto": "Implementation of NeuS-Facto. (slow)",
+    "dreamfusion": "Text to 3D generative NeRF model."
 }
 
 method_configs["nerfacto"] = TrainerConfig(
     method_name="nerfacto",
-    steps_per_eval_batch=20,
+    steps_per_eval_batch=500,
     steps_per_save=2000,
     max_num_iterations=30000,
     mixed_precision=True,
@@ -133,7 +135,8 @@ method_configs["nerfacto-big"] = TrainerConfig(
             train_num_rays_per_batch=4096,
             eval_num_rays_per_batch=4096,
             camera_optimizer=CameraOptimizerConfig(
-                mode="SO3xR3", optimizer=RAdamOptimizerConfig(lr=6e-4, eps=1e-8, weight_decay=1e-3)
+                mode="SO3xR3",
+                optimizer=RAdamOptimizerConfig(lr=6e-4, eps=1e-8, weight_decay=1e-3),
             ),
         ),
         model=NerfactoModelConfig(
@@ -493,6 +496,38 @@ method_configs["dreamfusion"] = TrainerConfig(
     vis="viewer",
 )
 
+method_configs["nerfplayer-nerfacto"] = TrainerConfig(
+    method_name="nerfplayer-nerfacto",
+    steps_per_eval_batch=500,
+    steps_per_save=2000,
+    max_num_iterations=30000,
+    mixed_precision=True,
+    pipeline=VanillaPipelineConfig(
+        datamanager=VanillaDataManagerConfig(
+            _target=VanillaDataManager[DepthDataset],
+            dataparser=DycheckDataParserConfig(),
+            train_num_rays_per_batch=4096,
+            eval_num_rays_per_batch=4096,
+            camera_optimizer=CameraOptimizerConfig(
+                mode="SO3xR3", optimizer=AdamOptimizerConfig(lr=6e-4, eps=1e-8, weight_decay=1e-2)
+            ),
+        ),
+        model=NerfplayerNerfactoModelConfig(eval_num_rays_per_chunk=1 << 15),
+    ),
+    optimizers={
+        "proposal_networks": {
+            "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15),
+            "scheduler": None,
+        },
+        "fields": {
+            "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15),
+            "scheduler": None,
+        },
+    },
+    viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
+    vis="viewer",
+)
+
 method_configs["nerfplayer-ngp"] = TrainerConfig(
     method_name="nerfplayer-ngp",
     steps_per_eval_batch=500,
@@ -577,7 +612,7 @@ method_configs["neus-facto"] = TrainerConfig(
             ),
         ),
         model=NeuSFactoModelConfig(
-            # proposal network allows for signifanctly smaller sdf/color network
+            # proposal network allows for significantly smaller sdf/color network
             sdf_field=SDFFieldConfig(
                 use_grid_feature=True,
                 num_layers=2,
@@ -609,9 +644,42 @@ method_configs["neus-facto"] = TrainerConfig(
     vis="viewer",
 )
 
-external_methods, external_descriptions = discover_methods()
-all_methods = {**method_configs, **external_methods}
-all_descriptions = {**descriptions, **external_descriptions}
+
+def merge_methods(methods, method_descriptions, new_methods, new_descriptions, overwrite=True):
+    """Merge new methods and descriptions into existing methods and descriptions.
+    Args:
+        methods: Existing methods.
+        method_descriptions: Existing descriptions.
+        new_methods: New methods to merge in.
+        new_descriptions: New descriptions to merge in.
+    Returns:
+        Merged methods and descriptions.
+    """
+    methods = OrderedDict(**methods)
+    method_descriptions = OrderedDict(**method_descriptions)
+    for k, v in new_methods.items():
+        if overwrite or k not in methods:
+            methods[k] = v
+            method_descriptions[k] = new_descriptions.get(k, "")
+    return methods, method_descriptions
+
+
+def sort_methods(methods, method_descriptions):
+    """Sort methods and descriptions by method name."""
+    methods = OrderedDict(sorted(methods.items(), key=lambda x: x[0]))
+    method_descriptions = OrderedDict(sorted(method_descriptions.items(), key=lambda x: x[0]))
+    return methods, method_descriptions
+
+
+all_methods, all_descriptions = method_configs, descriptions
+# Add discovered external methods
+all_methods, all_descriptions = merge_methods(all_methods, all_descriptions, *discover_methods())
+all_methods, all_descriptions = sort_methods(all_methods, all_descriptions)
+
+# Register all possible external methods which can be installed with Nerfstudio
+all_methods, all_descriptions = merge_methods(
+    all_methods, all_descriptions, *sort_methods(*get_external_methods()), overwrite=False
+)
 
 AnnotatedBaseConfigUnion = tyro.conf.SuppressFixed[  # Don't show unparseable (fixed) arguments in helptext.
     tyro.conf.FlagConversionOff[
